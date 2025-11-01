@@ -2,7 +2,7 @@ streamlit
 pandas
 numpy
 yfinance
-ta
+ta==0.10.2
 scikit-learn
 joblib
 plotly
