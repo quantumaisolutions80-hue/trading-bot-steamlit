@@ -1,43 +1,68 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import json
-import os
-from datetime import datetime
-import plotly.express as px
+import requests
+import time
 
-st.set_page_config(page_title="FX AI Trading Bot", layout="wide")
-st.title("📈 AI Forex Trading Bot – GBPUSD M5")
+st.set_page_config(page_title="Simple Trading Bot", layout="wide")
 
-# Live auto refresh every 1 second
-st.autorefresh(interval=1000, key="refresh")
+st.title("✅ Simple Trading Bot (No ta-lib required)")
 
-DATA_FILE = "data.json"
+# Fake wallet balance
+balance = 1000
 
-# Load or create data
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        data = json.load(f)
-        df = pd.DataFrame(data)
+# Function to get prices (Bitcoin fetch)
+def get_price():
+    try:
+        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+        data = requests.get(url).json()
+        price = float(data['price'])
+        return price
+    except:
+        return None
+
+# Simple trading signals (no ta-lib)
+def generate_signal(prices):
+    if len(prices) < 5:
+        return "NO-SIGNAL"
+
+    sma_short = np.mean(prices[-3:])  # last 3 prices
+    sma_long = np.mean(prices[-5:])   # last 5 prices
+
+    if sma_short > sma_long:
+        return "BUY"
+    elif sma_short < sma_long:
+        return "SELL"
+    else:
+        return "HOLD"
+
+# Price tracking
+if 'prices' not in st.session_state:
+    st.session_state.prices = []
+
+# Auto-refresh button
+autorefresh = st.checkbox("Auto Refresh")
+
+if autorefresh:
+    time.sleep(3)
+    st.experimental_rerun()
+
+price = get_price()
+
+if price:
+    st.session_state.prices.append(price)
+    st.write(f"📈 Latest Price: **${price:,.2f}**")
 else:
-    df = pd.DataFrame(columns=["time", "open", "high", "low", "close"])
+    st.error("Error fetching price!")
 
-st.subheader("Latest Market Data")
-st.dataframe(df.tail(20))
+# Show last prices
+st.line_chart(st.session_state.prices)
 
-if len(df) > 10:
-    fig = px.line(df, x="time", y="close", title="GBPUSD M5 Price")
-    st.plotly_chart(fig, use_container_width=True)
-
-st.subheader("Prediction Engine (Demo Mode)")
-if len(df) > 20:
-    last_close = df["close"].iloc[-1]
-    direction = np.random.choice(["UP", "DOWN"])
-    confidence = np.random.uniform(50, 100)
-
-    st.metric("Predicted Direction", direction)
-    st.metric("Confidence (%)", round(confidence, 2))
+# Signal
+if len(st.session_state.prices) >= 5:
+    signal = generate_signal(st.session_state.prices)
+    st.subheader(f"🔔 Trading Signal: **{signal}**")
 else:
-    st.info("Waiting for data...")
+    st.info("Collecting more price data...")
 
-st.success("✅ Streamlit UI Loaded Successfully")
+st.success("Bot running without ta-lib ✅")
