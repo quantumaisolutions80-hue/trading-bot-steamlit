@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+yfinance
+ta
+scikit-learn
+joblib
+plotly
+# optional:
+xgboost
+tensorflow
+MetaTrader5
