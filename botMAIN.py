@@ -1,4 +1,4 @@
-# app.py
+# app.py - Pattern Learning FX Bot (No TA dependency)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,15 +9,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import logging
 
-# indicators
-import ta
-
 # data
 import yfinance as yf
 
 # ML
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
+from sklearn.neighbors import NearestNeighbors
 import joblib
 
 # optional libs
@@ -45,31 +43,217 @@ except Exception:
 # ----------------------------
 # config & paths
 # ----------------------------
-st.set_page_config(page_title="Streamlit FX AI Bot", layout="wide")
+st.set_page_config(page_title="Pattern Learning FX Bot", layout="wide")
 DATA_DIR = Path("data")
 MODELS_DIR = Path("models")
+PATTERNS_DIR = Path("patterns")
 MEMORY_FILE = DATA_DIR / "core_memory.json"
 CSV_FILE = DATA_DIR / "gbpusd_m5.csv"
-RAW_JSON = DATA_DIR / "gbpusd_m5_raw.json"
+PATTERNS_FILE = PATTERNS_DIR / "winning_patterns.json"
+BUY_PATTERNS_FILE = PATTERNS_DIR / "buy_patterns.json"
+SELL_PATTERNS_FILE = PATTERNS_DIR / "sell_patterns.json"
+HIGH_TREND_FILE = PATTERNS_DIR / "high_trend_patterns.json"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+PATTERNS_DIR.mkdir(parents=True, exist_ok=True)
 
-FUTURE_LOOKAHEAD = 6    # 6*5m = 30m lookahead for labelling
+FUTURE_LOOKAHEAD = 6    # 6*5m = 30m lookahead
 TP_POINTS = 0.0010
 SL_POINTS = 0.0010
+MIN_PROFIT_TO_SAVE = 0.0005  # 5 pips minimum to save pattern
+HIGH_TREND_ADX_THRESHOLD = 25
 
 RF_ESTIMATORS = 100
 LSTM_EPOCHS = 6
 LSTM_BATCH = 64
 
-AUTO_REFRESH_SECONDS = 60  # Increased to reduce server load
+AUTO_REFRESH_SECONDS = 60
 
 # logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("streamlit_bot")
+logger = logging.getLogger("pattern_bot")
 
 # ----------------------------
-# core memory (persistent)
+# Custom Indicators (no TA library)
+# ----------------------------
+def sma(series, period):
+    """Simple Moving Average"""
+    return series.rolling(window=period).mean()
+
+def ema(series, period):
+    """Exponential Moving Average"""
+    return series.ewm(span=period, adjust=False).mean()
+
+def cci(high, low, close, period=20):
+    """Commodity Channel Index"""
+    tp = (high + low + close) / 3
+    sma_tp = tp.rolling(window=period).mean()
+    mad = tp.rolling(window=period).apply(lambda x: np.abs(x - x.mean()).mean())
+    cci_val = (tp - sma_tp) / (0.015 * mad)
+    return cci_val
+
+def true_range(high, low, close):
+    """True Range for ATR calculation"""
+    h_l = high - low
+    h_pc = np.abs(high - close.shift(1))
+    l_pc = np.abs(low - close.shift(1))
+    tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+    return tr
+
+def atr(high, low, close, period=14):
+    """Average True Range"""
+    tr = true_range(high, low, close)
+    return tr.rolling(window=period).mean()
+
+def bollinger_bands(close, period=20, num_std=2):
+    """Bollinger Bands"""
+    middle = close.rolling(window=period).mean()
+    std = close.rolling(window=period).std()
+    upper = middle + (std * num_std)
+    lower = middle - (std * num_std)
+    return upper, middle, lower
+
+def directional_movement(high, low, close, period=14):
+    """ADX, +DI, -DI calculation"""
+    # Plus and Minus Directional Movement
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+    
+    # When both are positive, only the larger one is kept
+    plus_dm[(plus_dm < minus_dm)] = 0
+    minus_dm[(minus_dm < plus_dm)] = 0
+    
+    # True Range
+    tr = true_range(high, low, close)
+    
+    # Smoothed TR and DM
+    atr_val = tr.rolling(window=period).mean()
+    plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr_val)
+    minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr_val)
+    
+    # ADX calculation
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    adx_val = dx.rolling(window=period).mean()
+    
+    return adx_val, plus_di, minus_di
+
+def compute_indicators(df):
+    """Compute all indicators without TA library"""
+    df = df.copy()
+    df.columns = [col.strip().title() if isinstance(col, str) else col for col in df.columns]
+    
+    required_cols = {"High", "Low", "Close"}
+    if not required_cols.issubset(set(df.columns)):
+        raise ValueError(f"Missing required columns. Have: {df.columns.tolist()}, Need: {required_cols}")
+    
+    # Moving averages
+    df["sma9"] = sma(df["Close"], 9)
+    df["ema30"] = ema(df["Close"], 30)
+    df["sma9_slope"] = df["sma9"].diff()
+    df["ema30_slope"] = df["ema30"].diff()
+    
+    # CCI
+    df["cci"] = cci(df["High"], df["Low"], df["Close"], period=20)
+    
+    # ADX with period 8 as requested
+    df["adx"], df["+di"], df["-di"] = directional_movement(df["High"], df["Low"], df["Close"], period=8)
+    df["+di_slope"] = df["+di"].diff()
+    df["-di_slope"] = df["-di"].diff()
+    
+    # Bollinger Bands
+    df["bb_upper"], df["bb_middle"], df["bb_lower"] = bollinger_bands(df["Close"], period=20)
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_middle"]
+    df["bb_position"] = (df["Close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"])
+    
+    # ATR
+    df["atr"] = atr(df["High"], df["Low"], df["Close"], period=14)
+    
+    return df
+
+# ----------------------------
+# Pattern storage and matching
+# ----------------------------
+def save_patterns(patterns, filename):
+    """Save patterns to JSON file"""
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    with open(filename, 'w') as f:
+        json.dump(patterns, f, indent=2, default=str)
+
+def load_patterns(filename):
+    """Load patterns from JSON file"""
+    if filename.exists():
+        try:
+            with open(filename, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading patterns from {filename}: {e}")
+            return []
+    return []
+
+def extract_pattern_features(df, idx):
+    """Extract indicator values at specific index as pattern signature"""
+    feature_cols = ["sma9", "ema30", "cci", "adx", "+di", "-di", 
+                   "bb_position", "bb_width", "atr", "sma9_slope", "ema30_slope"]
+    
+    pattern = {}
+    for col in feature_cols:
+        if col in df.columns:
+            pattern[col] = float(df[col].iloc[idx])
+    
+    # Additional context
+    pattern["close"] = float(df["Close"].iloc[idx])
+    pattern["timestamp"] = str(df.index[idx])
+    
+    return pattern
+
+def calculate_pattern_similarity(pattern1, pattern2):
+    """Calculate similarity score between two patterns (0-1, higher is more similar)"""
+    feature_keys = ["sma9_slope", "ema30_slope", "cci", "adx", "+di", "-di", "bb_position", "atr"]
+    
+    differences = []
+    for key in feature_keys:
+        if key in pattern1 and key in pattern2:
+            # Normalize by typical ranges
+            if key == "cci":
+                diff = abs(pattern1[key] - pattern2[key]) / 200  # CCI range ~-200 to 200
+            elif key in ["adx", "+di", "-di"]:
+                diff = abs(pattern1[key] - pattern2[key]) / 100  # 0-100 range
+            elif key == "bb_position":
+                diff = abs(pattern1[key] - pattern2[key])  # Already 0-1
+            elif key == "atr":
+                diff = abs(pattern1[key] - pattern2[key]) / 0.01  # Normalize by typical ATR
+            else:
+                diff = abs(pattern1[key] - pattern2[key]) / 0.001  # For slopes
+            
+            differences.append(min(diff, 1.0))
+    
+    if not differences:
+        return 0
+    
+    # Average difference, then convert to similarity
+    avg_diff = np.mean(differences)
+    similarity = 1 - avg_diff
+    return max(0, similarity)
+
+def find_similar_patterns(current_pattern, pattern_library, top_k=5, min_similarity=0.7):
+    """Find similar patterns from library"""
+    similarities = []
+    
+    for stored_pattern in pattern_library:
+        sim = calculate_pattern_similarity(current_pattern, stored_pattern)
+        if sim >= min_similarity:
+            similarities.append((stored_pattern, sim))
+    
+    # Sort by similarity
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    return similarities[:top_k]
+
+# ----------------------------
+# Core memory
 # ----------------------------
 def load_memory():
     if MEMORY_FILE.exists():
@@ -89,89 +273,22 @@ if "core_memory" not in st.session_state:
     st.session_state.core_memory.setdefault("rows", 0)
     st.session_state.core_memory.setdefault("models", {})
     st.session_state.core_memory.setdefault("metrics", {})
-    st.session_state.core_memory.setdefault("open_trades", [])
-    st.session_state.core_memory.setdefault("closed_trades", [])
+    st.session_state.core_memory.setdefault("patterns_count", {"buy": 0, "sell": 0, "high_trend": 0})
 
 # ----------------------------
-# auto-refresh with proper Streamlit handling
+# Auto-refresh
 # ----------------------------
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = time.time()
 
-# Check if refresh is needed
 elapsed = time.time() - st.session_state.last_refresh
 if elapsed >= AUTO_REFRESH_SECONDS:
     st.session_state.last_refresh = time.time()
-    time.sleep(0.1)  # Small delay to prevent rapid reruns
+    time.sleep(0.1)
     st.rerun()
 
-# Display refresh timer
-st.sidebar.write(f"Auto-refresh in: {int(AUTO_REFRESH_SECONDS - elapsed)}s")
-
 # ----------------------------
-# utilities: MT5 (local)
-# ----------------------------
-def mt5_connect_local():
-    if not MT5_AVAILABLE:
-        return False, "MetaTrader5 package not installed in this environment."
-    try:
-        ok = mt5.initialize()
-        if not ok:
-            return False, f"MT5 initialize failed: {mt5.last_error()}"
-        info = mt5.account_info()
-        if info is None:
-            return True, "MT5 initialized; terminal may not be logged in."
-        return True, f"MT5 connected. Account: {info.login} | Balance: {info.balance}"
-    except Exception as e:
-        return False, f"MT5 connect error: {e}"
-
-def mt5_get_rates(symbol="GBPUSD", timeframe=mt5.TIMEFRAME_M5, start=None, end=None):
-    if not MT5_AVAILABLE:
-        return None
-    if start is None or end is None:
-        return None
-    utc_from = int(start.timestamp())
-    utc_to = int(end.timestamp())
-    rates = mt5.copy_rates_range(symbol, timeframe, utc_from, utc_to)
-    if rates is None or len(rates) == 0:
-        return None
-    df = pd.DataFrame(rates)
-    df['datetime'] = pd.to_datetime(df['time'], unit='s')
-    df.set_index('datetime', inplace=True)
-    df = df.rename(columns={'open':'Open','high':'High','low':'Low','close':'Close','tick_volume':'Volume'})[['Open','High','Low','Close','Volume']]
-    return df
-
-def mt5_place_order(symbol, lot=0.01, order_type="BUY", sl=None, tp=None, deviation=5):
-    if not MT5_AVAILABLE:
-        return False, "mt5 not available"
-    if not mt5.initialize():
-        return False, f"MT5 init error: {mt5.last_error()}"
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        return False, f"{symbol} not in market watch"
-    if not symbol_info.visible:
-        mt5.symbol_select(symbol, True)
-    tick = mt5.symbol_info_tick(symbol)
-    price = tick.ask if order_type=="BUY" else tick.bid
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(lot),
-        "type": mt5.ORDER_TYPE_BUY if order_type=="BUY" else mt5.ORDER_TYPE_SELL,
-        "price": price,
-        "sl": sl,
-        "tp": tp,
-        "deviation": deviation,
-        "magic": 999999,
-        "comment": "streamlit-bot",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC
-    }
-    result = mt5.order_send(request)
-    return result, getattr(result, "comment", str(result))
-
-# ----------------------------
-# data download (MT5 preferred, fallback to yfinance)
+# Data download
 # ----------------------------
 def download_gbpusd_m5(start_date_str="2020-01-01", end_date_str=None):
     if end_date_str is None:
@@ -179,410 +296,607 @@ def download_gbpusd_m5(start_date_str="2020-01-01", end_date_str=None):
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=1)
 
-    # try MT5 if available
+    # Try MT5 if available (keeping original MT5 code)
     if MT5_AVAILABLE:
-        ok, msg = mt5_connect_local()
-        st.info(f"MT5: {msg}")
         try:
-            df_mt5 = mt5_get_rates("GBPUSD", timeframe=mt5.TIMEFRAME_M5, start=start_dt, end=end_dt)
-            if df_mt5 is not None and not df_mt5.empty:
-                df_mt5.to_csv(CSV_FILE)
-                df_mt5.reset_index().to_json(RAW_JSON, orient="records", date_format="iso")
-                st.session_state.core_memory['last_download'] = datetime.utcnow().isoformat()
-                st.session_state.core_memory['rows'] = len(df_mt5)
-                save_memory(st.session_state.core_memory)
-                return df_mt5
+            if mt5.initialize():
+                symbol = "GBPUSD"
+                timeframe = mt5.TIMEFRAME_M5
+                utc_from = int(start_dt.timestamp())
+                utc_to = int(end_dt.timestamp())
+                rates = mt5.copy_rates_range(symbol, timeframe, utc_from, utc_to)
+                if rates is not None and len(rates) > 0:
+                    df = pd.DataFrame(rates)
+                    df['datetime'] = pd.to_datetime(df['time'], unit='s')
+                    df.set_index('datetime', inplace=True)
+                    df = df.rename(columns={'open':'Open','high':'High','low':'Low','close':'Close','tick_volume':'Volume'})
+                    df = df[['Open','High','Low','Close','Volume']]
+                    df.to_csv(CSV_FILE)
+                    st.session_state.core_memory['last_download'] = datetime.utcnow().isoformat()
+                    st.session_state.core_memory['rows'] = len(df)
+                    save_memory(st.session_state.core_memory)
+                    return df
         except Exception as e:
             st.warning(f"MT5 download failed: {e}")
 
-    # fallback to yfinance chunked 30-day downloads (5m)
+    # Fallback to yfinance
     ticker = "GBPUSD=X"
     cur = start_dt
     frames = []
-    while cur < end_dt:
-        chunk_end = min(end_dt, cur + timedelta(days=30))
-        try:
-            df_chunk = yf.download(ticker, start=cur.strftime("%Y-%m-%d"), end=(chunk_end+timedelta(days=1)).strftime("%Y-%m-%d"), interval="5m", progress=False, threads=False)
-            if df_chunk is not None and not df_chunk.empty:
-                frames.append(df_chunk)
-        except Exception as e:
-            st.warning(f"yfinance chunk failed {cur} -> {chunk_end}: {e}")
-        cur = chunk_end + timedelta(days=1)
-        time.sleep(0.2)
+    
+    with st.spinner(f"Downloading from {start_dt.date()} to {end_dt.date()}..."):
+        while cur < end_dt:
+            chunk_end = min(end_dt, cur + timedelta(days=30))
+            try:
+                df_chunk = yf.download(ticker, start=cur.strftime("%Y-%m-%d"), 
+                                      end=(chunk_end+timedelta(days=1)).strftime("%Y-%m-%d"), 
+                                      interval="5m", progress=False, threads=False)
+                if df_chunk is not None and not df_chunk.empty:
+                    frames.append(df_chunk)
+                    st.write(f"✓ Downloaded {cur.date()} to {chunk_end.date()}: {len(df_chunk)} bars")
+            except Exception as e:
+                st.warning(f"Failed chunk {cur.date()}: {e}")
+            cur = chunk_end + timedelta(days=1)
+            time.sleep(0.3)
+    
     if frames:
         df = pd.concat(frames).sort_index()
         df = df[~df.index.duplicated(keep='first')]
-        # ensure standard column names - fixed capitalization
         df.columns = [col.strip().title() if isinstance(col, str) else col for col in df.columns]
         df.to_csv(CSV_FILE)
-        df.reset_index().to_json(RAW_JSON, orient="records", date_format="iso")
         st.session_state.core_memory['last_download'] = datetime.utcnow().isoformat()
         st.session_state.core_memory['rows'] = len(df)
         save_memory(st.session_state.core_memory)
         return df
     else:
-        st.error("No 5m data available from yfinance in that range. Try shorter range or use MT5 terminal.")
+        st.error("No data available in that range.")
         return pd.DataFrame()
 
 # ----------------------------
-# indicators, features, labels
+# Pattern-based Backtester
 # ----------------------------
-def compute_indicators(df):
-    df = df.copy()
-    # Standardize column names
-    df.columns = [col.strip().title() if isinstance(col, str) else col for col in df.columns]
-    
-    required_cols = {"High", "Low", "Close"}
-    if not required_cols.issubset(set(df.columns)):
-        raise ValueError(f"Missing required columns. Have: {df.columns.tolist()}, Need: {required_cols}")
-    
-    df["adx"] = ta.trend.adx(df["High"], df["Low"], df["Close"], window=14)
-    df["+di"] = ta.trend.adx_pos(df["High"], df["Low"], df["Close"], window=14)
-    df["-di"] = ta.trend.adx_neg(df["High"], df["Low"], df["Close"], window=14)
-    df["cci"] = ta.trend.cci(df["High"], df["Low"], df["Close"], window=20)
-    df["sma9"] = ta.trend.sma_indicator(df["Close"], window=9)
-    df["ema30"] = ta.trend.ema_indicator(df["Close"], window=30)
-    df["sma9_slope"] = df["sma9"].diff()
-    df["ema30_slope"] = df["ema30"].diff()
-    df["+di_slope"] = df["+di"].diff()
-    return df
-
-def create_labels(df, lookahead=FUTURE_LOOKAHEAD, tp=TP_POINTS, sl=SL_POINTS):
-    df2 = df.reset_index()
-    close = df2["Close"].values
-    labels = np.zeros(len(close), dtype=int)
-    for i in range(len(close)):
-        end_i = min(len(close)-1, i+lookahead)
-        win, lose = False, False
-        for j in range(i+1, end_i+1):
-            move = close[j] - close[i]
-            if move >= tp:
-                win = True
-                break
-            if move <= -sl:
-                lose = True
-                break
-        labels[i] = 1 if win and not lose else 0
-    df2["label"] = labels
-    df2 = df2.set_index(df.index.name if df.index.name else 'index')
-    return df2
-
-def prepare_features(df):
-    cols = ["adx","+di","-di","cci","sma9","ema30","sma9_slope","ema30_slope","+di_slope"]
-    feat = df[cols].copy()
-    # Fixed: Use ffill() instead of deprecated fillna(method="ffill")
-    feat = feat.ffill().fillna(0)
-    feat["sma_diff"] = feat["sma9"] - feat["ema30"]
-    return feat
-
-# ----------------------------
-# ML training
-# ----------------------------
-def train_models(df):
-    df_ind = compute_indicators(df)
-    df_lab = create_labels(df_ind)
-    df_lab = df_lab.dropna()
-    X = prepare_features(df_lab)
-    y = df_lab["label"].astype(int)
-    # time split
-    split = int(len(X)*0.8)
-    X_tr, X_te = X.iloc[:split], X.iloc[split:]
-    y_tr, y_te = y.iloc[:split], y.iloc[split:]
-    metrics = {}
-    
-    # Random Forest
-    rf = RandomForestClassifier(n_estimators=RF_ESTIMATORS, n_jobs=-1, random_state=42)
-    rf.fit(X_tr, y_tr)
-    joblib.dump(rf, MODELS_DIR / "rf.joblib")
-    pred_rf = rf.predict(X_te)
-    acc_rf = accuracy_score(y_te, pred_rf)
-    metrics["rf_acc"] = float(acc_rf)
-    
-    # XGBoost
-    if XGB_AVAILABLE:
-        try:
-            xgbm = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric="logloss")
-            xgbm.fit(X_tr, y_tr)
-            xgbm.save_model(str(MODELS_DIR / "xgb.json"))
-            pred_xgb = xgbm.predict(X_te)
-            metrics["xgb_acc"] = float(accuracy_score(y_te, pred_xgb))
-        except Exception as e:
-            st.warning(f"XGBoost training failed: {e}")
-    
-    # LSTM
-    if TF_AVAILABLE:
-        try:
-            from sklearn.preprocessing import StandardScaler
-            scaler = StandardScaler()
-            Xs = scaler.fit_transform(X_tr)
-            Xs_test = scaler.transform(X_te)
-            Xs = Xs.reshape((Xs.shape[0],1,Xs.shape[1]))
-            Xs_test_seq = Xs_test.reshape((Xs_test.shape[0],1,Xs_test.shape[1]))
-            model = Sequential()
-            model.add(LSTM(64, input_shape=(Xs.shape[1], Xs.shape[2])))
-            model.add(Dropout(0.2))
-            model.add(Dense(1, activation="sigmoid"))
-            model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
-            model.fit(Xs, y_tr, epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH, verbose=0)
-            probs = model.predict(Xs_test_seq).reshape(-1)
-            preds = (probs>0.5).astype(int)
-            metrics["lstm_acc"] = float(accuracy_score(y_te, preds))
-            model.save(str(MODELS_DIR / "lstm"))
-            joblib.dump(scaler, MODELS_DIR / "lstm_scaler.pkl")
-        except Exception as e:
-            st.warning(f"LSTM training failed: {e}")
-    
-    st.session_state.core_memory["models"] = {"rf": str(MODELS_DIR / "rf.joblib")}
-    st.session_state.core_memory["metrics"] = metrics
-    save_memory(st.session_state.core_memory)
-    return metrics
-
-def load_models():
-    models = {}
-    rf_file = MODELS_DIR / "rf.joblib"
-    if rf_file.exists():
-        models["rf"] = joblib.load(rf_file)
-    
-    if XGB_AVAILABLE and (MODELS_DIR / "xgb.json").exists():
-        try:
-            # Fixed: Load XGBoost model correctly
-            xgbm = xgb.XGBClassifier()
-            xgbm.load_model(str(MODELS_DIR / "xgb.json"))
-            models["xgb"] = xgbm
-        except Exception as e:
-            logger.warning(f"Failed to load XGBoost model: {e}")
-    
-    if TF_AVAILABLE and (MODELS_DIR / "lstm").exists():
-        try:
-            models["lstm"] = tf.keras.models.load_model(str(MODELS_DIR / "lstm"))
-            if (MODELS_DIR / "lstm_scaler.pkl").exists():
-                models["lstm_scaler"] = joblib.load(MODELS_DIR / "lstm_scaler.pkl")
-        except Exception as e:
-            logger.warning(f"Failed to load LSTM model: {e}")
-    
-    return models
-
-def predict_latest(models, df):
-    df_ind = compute_indicators(df.tail(200))
-    feat = prepare_features(df_ind).tail(1)
-    X = feat.values
-    out = {}
-    
-    if "rf" in models:
-        out["rf"] = int(models["rf"].predict(X)[0])
-    
-    if "xgb" in models:
-        try:
-            # Fixed: Use predict method directly on XGBClassifier
-            out["xgb"] = int(models["xgb"].predict(X)[0])
-        except Exception as e:
-            logger.warning(f"XGBoost prediction failed: {e}")
-    
-    if "lstm" in models:
-        try:
-            scaler = models.get("lstm_scaler")
-            Xs = scaler.transform(X) if scaler is not None else X
-            Xs_seq = Xs.reshape((Xs.shape[0],1,Xs.shape[1]))
-            proba = float(models["lstm"].predict(Xs_seq)[0][0])
-            out["lstm_proba"] = proba
-            out["lstm"] = int(proba>0.5)
-        except Exception as e:
-            logger.warning(f"LSTM prediction failed: {e}")
-    
-    return out
-
-# ----------------------------
-# Backtester (simple)
-# ----------------------------
-def backtest_with_model(df, model_name="rf", verbose=False):
+def backtest_with_pattern_learning(df, save_patterns_flag=True):
     """
-    Simulate entries where model predicts 1 at bar t -> open market at t+1 close price,
-    close when TP/SL hit within lookahead or at next opposite signal or end.
+    Run backtest and save winning patterns
     """
-    if not CSV_FILE.exists():
-        return {"error":"No data to backtest"}
-    models = load_models()
-    if model_name not in models:
-        return {"error":f"Model {model_name} not found"}
-    
     df_ind = compute_indicators(df)
-    df_lab = create_labels(df_ind)
-    feats = prepare_features(df_lab).fillna(0)
-    n = len(feats)
+    df_ind = df_ind.dropna()
+    
+    n = len(df_ind)
+    buy_patterns = []
+    sell_patterns = []
+    high_trend_patterns = []
+    all_trades = []
+    
     cash = 0.0
-    trades = []
-    i = 0
     
-    while i < n-1:
-        X = feats.iloc[i].values.reshape(1,-1)
-        pred = None
+    st.write(f"Running backtest on {n} bars from {df_ind.index[0]} to {df_ind.index[-1]}")
+    
+    # Simple strategy: Buy when +DI > -DI and ADX > 20, Sell when opposite
+    for i in range(n - FUTURE_LOOKAHEAD - 1):
+        current_adx = df_ind["adx"].iloc[i]
+        current_plus_di = df_ind["+di"].iloc[i]
+        current_minus_di = df_ind["-di"].iloc[i]
         
-        if model_name=="rf":
-            pred = int(models["rf"].predict(X)[0])
-        elif model_name=="xgb" and "xgb" in models:
-            try:
-                pred = int(models["xgb"].predict(X)[0])
-            except Exception as e:
-                logger.warning(f"XGB prediction error: {e}")
-                pred = 0
-        elif model_name=="lstm" and "lstm" in models:
-            try:
-                scaler = models.get("lstm_scaler")
-                Xs = scaler.transform(X) if scaler else X
-                Xs_seq = Xs.reshape((Xs.shape[0],1,Xs.shape[1]))
-                proba = float(models["lstm"].predict(Xs_seq)[0][0])
-                pred = int(proba>0.5)
-            except Exception as e:
-                logger.warning(f"LSTM prediction error: {e}")
-                pred = 0
-        else:
-            pred = 0
+        # Skip if indicators not ready
+        if pd.isna(current_adx) or pd.isna(current_plus_di) or pd.isna(current_minus_di):
+            continue
         
-        if pred == 1:
-            entry_idx = min(n-1, i+1)
-            entry_price = df_lab["Close"].iloc[entry_idx]
-            closed = False
+        # BUY signal
+        if current_plus_di > current_minus_di and current_adx > 15:
+            entry_idx = i + 1
+            if entry_idx >= n:
+                continue
+                
+            entry_price = df_ind["Close"].iloc[entry_idx]
             
-            for j in range(entry_idx+1, min(entry_idx+1+FUTURE_LOOKAHEAD, n)):
-                p = df_lab["Close"].iloc[j]
-                if p - entry_price >= TP_POINTS:
-                    profit = p - entry_price
-                    trades.append({"open_idx":entry_idx, "close_idx":j, "pl":profit})
-                    cash += profit
-                    closed = True
-                    i = j
+            # Look ahead for TP/SL
+            profit = None
+            exit_idx = None
+            max_profit = 0
+            
+            for j in range(entry_idx + 1, min(entry_idx + FUTURE_LOOKAHEAD + 1, n)):
+                current_price = df_ind["Close"].iloc[j]
+                current_profit = current_price - entry_price
+                max_profit = max(max_profit, current_profit)
+                
+                # TP hit
+                if current_profit >= TP_POINTS:
+                    profit = current_profit
+                    exit_idx = j
                     break
-                if p - entry_price <= -SL_POINTS:
-                    profit = p - entry_price
-                    trades.append({"open_idx":entry_idx, "close_idx":j, "pl":profit})
-                    cash += profit
-                    closed = True
-                    i = j
+                # SL hit
+                if current_profit <= -SL_POINTS:
+                    profit = current_profit
+                    exit_idx = j
                     break
             
-            if not closed:
-                end_j = min(entry_idx+FUTURE_LOOKAHEAD, n-1)
-                p = df_lab["Close"].iloc[end_j]
-                profit = p - entry_price
-                trades.append({"open_idx":entry_idx, "close_idx":end_j, "pl":profit})
-                cash += profit
-                i = end_j
-        i += 1
+            # If no TP/SL hit, close at end of lookahead
+            if profit is None:
+                exit_idx = min(entry_idx + FUTURE_LOOKAHEAD, n - 1)
+                profit = df_ind["Close"].iloc[exit_idx] - entry_price
+            
+            cash += profit
+            
+            trade_info = {
+                "type": "BUY",
+                "entry_idx": int(entry_idx),
+                "exit_idx": int(exit_idx),
+                "entry_price": float(entry_price),
+                "exit_price": float(df_ind["Close"].iloc[exit_idx]),
+                "profit": float(profit),
+                "max_profit": float(max_profit),
+                "adx": float(current_adx),
+                "duration": int(exit_idx - entry_idx)
+            }
+            all_trades.append(trade_info)
+            
+            # Save winning patterns
+            if save_patterns_flag and profit > MIN_PROFIT_TO_SAVE:
+                pattern = extract_pattern_features(df_ind, i)
+                pattern["profit"] = float(profit)
+                pattern["max_profit"] = float(max_profit)
+                pattern["trade_type"] = "BUY"
+                pattern["duration"] = int(exit_idx - entry_idx)
+                
+                buy_patterns.append(pattern)
+                
+                # High trend pattern
+                if current_adx > HIGH_TREND_ADX_THRESHOLD:
+                    pattern_ht = pattern.copy()
+                    pattern_ht["trend_strength"] = "HIGH"
+                    high_trend_patterns.append(pattern_ht)
+        
+        # SELL signal
+        elif current_minus_di > current_plus_di and current_adx > 15:
+            entry_idx = i + 1
+            if entry_idx >= n:
+                continue
+                
+            entry_price = df_ind["Close"].iloc[entry_idx]
+            
+            profit = None
+            exit_idx = None
+            max_profit = 0
+            
+            for j in range(entry_idx + 1, min(entry_idx + FUTURE_LOOKAHEAD + 1, n)):
+                current_price = df_ind["Close"].iloc[j]
+                current_profit = entry_price - current_price  # Reverse for sell
+                max_profit = max(max_profit, current_profit)
+                
+                if current_profit >= TP_POINTS:
+                    profit = current_profit
+                    exit_idx = j
+                    break
+                if current_profit <= -SL_POINTS:
+                    profit = current_profit
+                    exit_idx = j
+                    break
+            
+            if profit is None:
+                exit_idx = min(entry_idx + FUTURE_LOOKAHEAD, n - 1)
+                profit = entry_price - df_ind["Close"].iloc[exit_idx]
+            
+            cash += profit
+            
+            trade_info = {
+                "type": "SELL",
+                "entry_idx": int(entry_idx),
+                "exit_idx": int(exit_idx),
+                "entry_price": float(entry_price),
+                "exit_price": float(df_ind["Close"].iloc[exit_idx]),
+                "profit": float(profit),
+                "max_profit": float(max_profit),
+                "adx": float(current_adx),
+                "duration": int(exit_idx - entry_idx)
+            }
+            all_trades.append(trade_info)
+            
+            if save_patterns_flag and profit > MIN_PROFIT_TO_SAVE:
+                pattern = extract_pattern_features(df_ind, i)
+                pattern["profit"] = float(profit)
+                pattern["max_profit"] = float(max_profit)
+                pattern["trade_type"] = "SELL"
+                pattern["duration"] = int(exit_idx - entry_idx)
+                
+                sell_patterns.append(pattern)
+                
+                if current_adx > HIGH_TREND_ADX_THRESHOLD:
+                    pattern_ht = pattern.copy()
+                    pattern_ht["trend_strength"] = "HIGH"
+                    high_trend_patterns.append(pattern_ht)
     
-    total_trades = len(trades)
-    wins = sum(1 for t in trades if t["pl"]>0)
+    # Save patterns
+    if save_patterns_flag:
+        save_patterns(buy_patterns, BUY_PATTERNS_FILE)
+        save_patterns(sell_patterns, SELL_PATTERNS_FILE)
+        save_patterns(high_trend_patterns, HIGH_TREND_FILE)
+        
+        st.session_state.core_memory["patterns_count"] = {
+            "buy": len(buy_patterns),
+            "sell": len(sell_patterns),
+            "high_trend": len(high_trend_patterns)
+        }
+        save_memory(st.session_state.core_memory)
+    
+    # Calculate metrics
+    total_trades = len(all_trades)
+    wins = sum(1 for t in all_trades if t["profit"] > 0)
     losses = total_trades - wins
-    net = cash
-    win_rate = wins/total_trades if total_trades>0 else 0
-    return {"trades":total_trades, "wins":wins, "losses":losses, "net":float(net), "win_rate":float(win_rate), "trades_list":trades}
+    win_rate = wins / total_trades if total_trades > 0 else 0
+    
+    winning_trades = [t for t in all_trades if t["profit"] > 0]
+    losing_trades = [t for t in all_trades if t["profit"] <= 0]
+    
+    avg_win = np.mean([t["profit"] for t in winning_trades]) if winning_trades else 0
+    avg_loss = np.mean([t["profit"] for t in losing_trades]) if losing_trades else 0
+    
+    return {
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_profit": float(cash),
+        "avg_win": float(avg_win),
+        "avg_loss": float(avg_loss),
+        "buy_patterns_saved": len(buy_patterns),
+        "sell_patterns_saved": len(sell_patterns),
+        "high_trend_patterns_saved": len(high_trend_patterns),
+        "all_trades": all_trades
+    }
+
+# ----------------------------
+# Pattern-based prediction
+# ----------------------------
+def predict_with_patterns(df):
+    """Predict using saved patterns"""
+    df_ind = compute_indicators(df.tail(200))
+    df_ind = df_ind.dropna()
+    
+    if len(df_ind) == 0:
+        return {"error": "Not enough data"}
+    
+    # Get current pattern
+    current_pattern = extract_pattern_features(df_ind, -1)
+    
+    # Load patterns
+    buy_patterns = load_patterns(BUY_PATTERNS_FILE)
+    sell_patterns = load_patterns(SELL_PATTERNS_FILE)
+    high_trend_patterns = load_patterns(HIGH_TREND_FILE)
+    
+    # Find similar patterns
+    similar_buys = find_similar_patterns(current_pattern, buy_patterns, top_k=5, min_similarity=0.65)
+    similar_sells = find_similar_patterns(current_pattern, sell_patterns, top_k=5, min_similarity=0.65)
+    similar_ht = find_similar_patterns(current_pattern, high_trend_patterns, top_k=5, min_similarity=0.7)
+    
+    # Calculate confidence scores
+    buy_confidence = np.mean([sim for _, sim in similar_buys]) if similar_buys else 0
+    sell_confidence = np.mean([sim for _, sim in similar_sells]) if similar_sells else 0
+    ht_confidence = np.mean([sim for _, sim in similar_ht]) if similar_ht else 0
+    
+    # Recommendation
+    if buy_confidence > sell_confidence and buy_confidence > 0.7:
+        recommendation = "BUY"
+    elif sell_confidence > buy_confidence and sell_confidence > 0.7:
+        recommendation = "SELL"
+    else:
+        recommendation = "HOLD"
+    
+    return {
+        "recommendation": recommendation,
+        "buy_confidence": float(buy_confidence),
+        "sell_confidence": float(sell_confidence),
+        "high_trend_confidence": float(ht_confidence),
+        "similar_buy_patterns": len(similar_buys),
+        "similar_sell_patterns": len(similar_sells),
+        "similar_ht_patterns": len(similar_ht),
+        "current_indicators": current_pattern,
+        "top_similar_buys": [(p["timestamp"], p["profit"], sim) for p, sim in similar_buys[:3]],
+        "top_similar_sells": [(p["timestamp"], p["profit"], sim) for p, sim in similar_sells[:3]]
+    }
 
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.title("FX AI Trading Bot — GBPUSD M5")
-col1, col2 = st.columns([2,1])
+st.title("🧠 Pattern Learning FX Bot — GBPUSD M5")
+st.markdown("**Self-learning bot that captures and reuses winning trade patterns**")
 
-with col2:
-    st.header("Controls")
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Controls")
     start = st.date_input("Start date", value=datetime(2020,1,1))
     end = st.date_input("End date", value=datetime.utcnow().date())
-    download_btn = st.button("Download GBPUSD M5 (MT5 preferred)")
-    train_btn = st.button("Train models (RF/XGB/LSTM)")
-    backtest_btn = st.button("Backtest (RF)")
-    predict_btn = st.button("Predict latest")
+    
     st.markdown("---")
-    st.write("MT5 Live (local only)")
-    st.write(f"MT5 package available: {MT5_AVAILABLE}")
-    check_mt5 = st.button("Check MT5 connection")
-    lot = st.number_input("Lot size (local only)", min_value=0.01, value=0.01, step=0.01)
-    buy_btn = st.button("Place BUY (local)")
-    sell_btn = st.button("Place SELL (local)")
+    download_btn = st.button("📥 Download Data")
+    backtest_btn = st.button("🔬 Run Backtest & Learn Patterns")
+    predict_btn = st.button("🎯 Predict with Patterns")
+    
     st.markdown("---")
-    st.write("Core memory")
-    st.json(st.session_state.core_memory)
+    st.subheader("📊 Pattern Library")
+    st.metric("Buy Patterns", st.session_state.core_memory.get("patterns_count", {}).get("buy", 0))
+    st.metric("Sell Patterns", st.session_state.core_memory.get("patterns_count", {}).get("sell", 0))
+    st.metric("High Trend Patterns", st.session_state.core_memory.get("patterns_count", {}).get("high_trend", 0))
+    
+    st.markdown("---")
+    st.write(f"⏱️ Auto-refresh in: {int(AUTO_REFRESH_SECONDS - elapsed)}s")
+
+# Main content
+col1, col2 = st.columns([2, 1])
 
 with col1:
-    st.header("Data & Chart")
+    st.header("📈 Data & Chart")
+    
     if download_btn:
-        with st.spinner("Downloading..."):
-            df = download_gbpusd_m5(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-            if df is None or df.empty:
-                st.error("Download failed or empty.")
-            else:
-                st.success(f"Downloaded {len(df)} rows.")
+        df = download_gbpusd_m5(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if df is not None and not df.empty:
+            st.success(f"✅ Downloaded {len(df)} bars")
     else:
         if CSV_FILE.exists():
             df = pd.read_csv(CSV_FILE, index_col=0, parse_dates=True)
-            st.write(f"Loaded {len(df)} rows from local CSV")
+            st.info(f"📊 Loaded {len(df)} bars from local CSV")
         else:
             df = pd.DataFrame()
-            st.info("No local data. Click Download to fetch data.")
-
+            st.warning("⚠️ No local data. Click Download to fetch data.")
+    
     if not df.empty:
-        st.line_chart(df["Close"].tail(500))
+        st.line_chart(df["Close"].tail(1000), height=300)
+        
+        # Show latest indicators
+        try:
+            df_ind = compute_indicators(df.tail(100))
+            st.subheader("Latest Indicators")
+            latest = df_ind.iloc[-1]
+            
+            col_a, col_b, col_c, col_d = st.columns(4)
+            col_a.metric("ADX", f"{latest['adx']:.1f}")
+            col_b.metric("+DI", f"{latest['+di']:.1f}")
+            col_c.metric("-DI", f"{latest['-di']:.1f}")
+            col_d.metric("CCI", f"{latest['cci']:.1f}")
+            
+            col_e, col_f, col_g, col_h = st.columns(4)
+            col_e.metric("SMA9", f"{latest['sma9']:.5f}")
+            col_f.metric("EMA30", f"{latest['ema30']:.5f}")
+            col_g.metric("ATR", f"{latest['atr']:.5f}")
+            col_h.metric("BB Pos", f"{latest['bb_position']:.2f}")
+        except Exception as e:
+            st.error(f"Error computing indicators: {e}")
 
-    st.header("Models & Predictions")
-    if train_btn:
-        if df.empty:
-            st.warning("No data to train on. Download first.")
-        else:
-            with st.spinner("Training..."):
-                metrics = train_models(df)
-                st.success("Training finished")
-                st.json(metrics)
-
+with col2:
+    st.header("🎯 Predictions")
+    
     if predict_btn:
         if not CSV_FILE.exists():
             st.warning("No data file. Download first.")
         else:
             df_local = pd.read_csv(CSV_FILE, index_col=0, parse_dates=True)
-            models = load_models()
-            if not models:
-                st.warning("No models found. Train first.")
+            
+            # Check if patterns exist
+            if not BUY_PATTERNS_FILE.exists() or not SELL_PATTERNS_FILE.exists():
+                st.warning("⚠️ No patterns found. Run backtest first to learn patterns.")
             else:
-                preds = predict_latest(models, df_local)
-                st.json(preds)
+                with st.spinner("Analyzing patterns..."):
+                    result = predict_with_patterns(df_local)
+                    
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        # Display recommendation
+                        rec = result["recommendation"]
+                        if rec == "BUY":
+                            st.success(f"🟢 **{rec}** Signal")
+                        elif rec == "SELL":
+                            st.error(f"🔴 **{rec}** Signal")
+                        else:
+                            st.info(f"⚪ **{rec}**")
+                        
+                        # Confidence scores
+                        st.metric("Buy Confidence", f"{result['buy_confidence']*100:.1f}%")
+                        st.metric("Sell Confidence", f"{result['sell_confidence']*100:.1f}%")
+                        st.metric("High Trend Confidence", f"{result['high_trend_confidence']*100:.1f}%")
+                        
+                        st.markdown("---")
+                        st.write(f"📊 Similar Buy Patterns: {result['similar_buy_patterns']}")
+                        st.write(f"📊 Similar Sell Patterns: {result['similar_sell_patterns']}")
+                        
+                        # Show top similar patterns
+                        if result['top_similar_buys']:
+                            st.markdown("**Top Similar Buy Patterns:**")
+                            for ts, profit, sim in result['top_similar_buys']:
+                                st.write(f"  - {ts}: Profit={profit:.6f}, Similarity={sim:.2f}")
+                        
+                        if result['top_similar_sells']:
+                            st.markdown("**Top Similar Sell Patterns:**")
+                            for ts, profit, sim in result['top_similar_sells']:
+                                st.write(f"  - {ts}: Profit={profit:.6f}, Similarity={sim:.2f}")
 
-    if backtest_btn:
-        if not CSV_FILE.exists():
-            st.warning("No data file. Download first.")
-        else:
-            df_local = pd.read_csv(CSV_FILE, index_col=0, parse_dates=True)
-            res = backtest_with_model(df_local, model_name="rf")
-            if "error" in res:
-                st.error(res["error"])
-            else:
-                st.metric("Total trades", res["trades"])
-                st.metric("Net P/L", round(res["net"],6))
-                st.metric("Win rate", f"{res['win_rate']*100:.2f}%")
-                st.write("Sample trades (first 20):")
-                st.write(res["trades_list"][:20])
-
-# MT5 buttons handling
-if check_mt5:
-    ok, msg = mt5_connect_local()
-    st.write(msg)
-
-if buy_btn or sell_btn:
-    if not MT5_AVAILABLE:
-        st.error("MT5 not available. Local MT5 & package required.")
-    else:
-        if not mt5.initialize():
-            st.error(f"MT5 init error: {mt5.last_error()}")
-        else:
-            side = "BUY" if buy_btn else "SELL"
-            res, info = mt5_place_order("GBPUSD", lot=lot, order_type=side)
-            st.write("Order result:", info)
-            st.session_state.core_memory.setdefault("open_trades", [])
-            st.session_state.core_memory["open_trades"].append({"time":datetime.utcnow().isoformat(),"type":side,"lot":float(lot),"result":str(info)})
-            save_memory(st.session_state.core_memory)
-
-# final: show memory summary and models list
+# Backtest results section
 st.markdown("---")
-st.subheader("Summary")
-st.write("Last download:", st.session_state.core_memory.get("last_download"))
-st.write("Rows:", st.session_state.core_memory.get("rows"))
-st.write("Models saved:", os.listdir(MODELS_DIR) if MODELS_DIR.exists() else [])
-st.write("Metrics:", st.session_state.core_memory.get("metrics"))
-st.write("Open trades (recent):", st.session_state.core_memory.get("open_trades")[-5:])
-st.write("Closed trades (recent):", st.session_state.core_memory.get("closed_trades")[-5:])
+st.header("📊 Backtest Results")
+
+if backtest_btn:
+    if not CSV_FILE.exists():
+        st.error("No data file. Download first.")
+    else:
+        df_local = pd.read_csv(CSV_FILE, index_col=0, parse_dates=True)
+        
+        with st.spinner("Running backtest and learning patterns..."):
+            results = backtest_with_pattern_learning(df_local, save_patterns_flag=True)
+            
+            st.success("✅ Backtest complete!")
+            
+            # Display metrics
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Trades", results["total_trades"])
+            col2.metric("Win Rate", f"{results['win_rate']*100:.1f}%")
+            col3.metric("Net Profit", f"{results['net_profit']:.6f}")
+            col4.metric("Wins/Losses", f"{results['wins']}/{results['losses']}")
+            
+            col5, col6, col7, col8 = st.columns(4)
+            col5.metric("Avg Win", f"{results['avg_win']:.6f}")
+            col6.metric("Avg Loss", f"{results['avg_loss']:.6f}")
+            col7.metric("Buy Patterns", results["buy_patterns_saved"])
+            col8.metric("Sell Patterns", results["sell_patterns_saved"])
+            
+            st.metric("🔥 High Trend Patterns Saved", results["high_trend_patterns_saved"])
+            
+            # Show trade details
+            st.markdown("---")
+            st.subheader("Recent Trades (Last 20)")
+            
+            trades_df = pd.DataFrame(results["all_trades"][-20:])
+            if not trades_df.empty:
+                # Format for display
+                trades_df["profit"] = trades_df["profit"].apply(lambda x: f"{x:.6f}")
+                trades_df["entry_price"] = trades_df["entry_price"].apply(lambda x: f"{x:.5f}")
+                trades_df["exit_price"] = trades_df["exit_price"].apply(lambda x: f"{x:.5f}")
+                trades_df["adx"] = trades_df["adx"].apply(lambda x: f"{x:.1f}")
+                
+                st.dataframe(trades_df, use_container_width=True)
+            
+            # Show winning trades breakdown
+            st.markdown("---")
+            st.subheader("Winning Trades Analysis")
+            
+            winning_trades = [t for t in results["all_trades"] if t["profit"] > 0]
+            
+            if winning_trades:
+                buy_wins = [t for t in winning_trades if t["type"] == "BUY"]
+                sell_wins = [t for t in winning_trades if t["type"] == "SELL"]
+                high_trend_wins = [t for t in winning_trades if t["adx"] > HIGH_TREND_ADX_THRESHOLD]
+                
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("Buy Wins", len(buy_wins))
+                col_b.metric("Sell Wins", len(sell_wins))
+                col_c.metric("High Trend Wins", len(high_trend_wins))
+                
+                # Profit distribution
+                profits = [t["profit"] for t in winning_trades]
+                st.write(f"**Profit Range:** {min(profits):.6f} to {max(profits):.6f}")
+                st.write(f"**Median Profit:** {np.median(profits):.6f}")
+                
+                # Show best trades
+                st.markdown("**Top 10 Most Profitable Trades:**")
+                top_trades = sorted(winning_trades, key=lambda x: x["profit"], reverse=True)[:10]
+                top_df = pd.DataFrame(top_trades)
+                top_df["profit"] = top_df["profit"].apply(lambda x: f"{x:.6f}")
+                top_df["adx"] = top_df["adx"].apply(lambda x: f"{x:.1f}")
+                st.dataframe(top_df[["type", "profit", "adx", "duration"]], use_container_width=True)
+
+# Pattern library viewer
+st.markdown("---")
+st.header("📚 Pattern Library Viewer")
+
+view_patterns = st.selectbox("View Patterns", ["None", "Buy Patterns", "Sell Patterns", "High Trend Patterns"])
+
+if view_patterns != "None":
+    if view_patterns == "Buy Patterns":
+        patterns = load_patterns(BUY_PATTERNS_FILE)
+        st.write(f"**Total Buy Patterns:** {len(patterns)}")
+    elif view_patterns == "Sell Patterns":
+        patterns = load_patterns(SELL_PATTERNS_FILE)
+        st.write(f"**Total Sell Patterns:** {len(patterns)}")
+    else:
+        patterns = load_patterns(HIGH_TREND_FILE)
+        st.write(f"**Total High Trend Patterns:** {len(patterns)}")
+    
+    if patterns:
+        # Show sample patterns
+        st.write("**Sample Patterns (first 10):**")
+        for i, pattern in enumerate(patterns[:10]):
+            with st.expander(f"Pattern {i+1}: Profit={pattern.get('profit', 0):.6f}, Type={pattern.get('trade_type', 'N/A')}"):
+                st.json(pattern)
+        
+        # Statistics
+        st.markdown("---")
+        st.subheader("Pattern Statistics")
+        
+        profits = [p.get("profit", 0) for p in patterns]
+        adx_values = [p.get("adx", 0) for p in patterns]
+        durations = [p.get("duration", 0) for p in patterns]
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Avg Profit", f"{np.mean(profits):.6f}")
+        col1.metric("Max Profit", f"{max(profits):.6f}")
+        
+        col2.metric("Avg ADX", f"{np.mean(adx_values):.1f}")
+        col2.metric("Max ADX", f"{max(adx_values):.1f}")
+        
+        col3.metric("Avg Duration", f"{np.mean(durations):.1f} bars")
+        col3.metric("Max Duration", f"{max(durations)} bars")
+
+# Pattern matching test
+st.markdown("---")
+st.header("🔍 Pattern Matching Test")
+
+if st.button("Test Pattern Matching on Latest Bar"):
+    if not CSV_FILE.exists():
+        st.warning("No data file.")
+    else:
+        df_local = pd.read_csv(CSV_FILE, index_col=0, parse_dates=True)
+        df_ind = compute_indicators(df_local.tail(100))
+        df_ind = df_ind.dropna()
+        
+        if len(df_ind) > 0:
+            current = extract_pattern_features(df_ind, -1)
+            
+            st.write("**Current Market Pattern:**")
+            st.json(current)
+            
+            # Test against all pattern types
+            buy_patterns = load_patterns(BUY_PATTERNS_FILE)
+            sell_patterns = load_patterns(SELL_PATTERNS_FILE)
+            ht_patterns = load_patterns(HIGH_TREND_FILE)
+            
+            if buy_patterns or sell_patterns or ht_patterns:
+                st.markdown("---")
+                st.subheader("Similar Patterns Found:")
+                
+                if buy_patterns:
+                    similar_buys = find_similar_patterns(current, buy_patterns, top_k=3, min_similarity=0.6)
+                    if similar_buys:
+                        st.write("**Buy Patterns:**")
+                        for pattern, similarity in similar_buys:
+                            st.write(f"  - Similarity: {similarity:.2f}, Profit: {pattern['profit']:.6f}, Time: {pattern['timestamp']}")
+                
+                if sell_patterns:
+                    similar_sells = find_similar_patterns(current, sell_patterns, top_k=3, min_similarity=0.6)
+                    if similar_sells:
+                        st.write("**Sell Patterns:**")
+                        for pattern, similarity in similar_sells:
+                            st.write(f"  - Similarity: {similarity:.2f}, Profit: {pattern['profit']:.6f}, Time: {pattern['timestamp']}")
+                
+                if ht_patterns:
+                    similar_ht = find_similar_patterns(current, ht_patterns, top_k=3, min_similarity=0.65)
+                    if similar_ht:
+                        st.write("**High Trend Patterns:**")
+                        for pattern, similarity in similar_ht:
+                            st.write(f"  - Similarity: {similarity:.2f}, Profit: {pattern['profit']:.6f}, Time: {pattern['timestamp']}")
+            else:
+                st.info("No patterns in library yet. Run backtest first.")
+
+# Summary footer
+st.markdown("---")
+st.subheader("💾 System Summary")
+
+col_x, col_y, col_z = st.columns(3)
+col_x.write(f"**Last Download:** {st.session_state.core_memory.get('last_download', 'Never')}")
+col_y.write(f"**Total Bars:** {st.session_state.core_memory.get('rows', 0)}")
+col_z.write(f"**Data File:** {'✅ Exists' if CSV_FILE.exists() else '❌ Missing'}")
+
+st.markdown("---")
+st.info("""
+**How it works:**
+1. **Download Data**: Get GBPUSD M5 data from 2020 to present
+2. **Run Backtest**: The bot trades using ADX/DI strategy and saves all winning patterns (profit > 5 pips)
+3. **Pattern Learning**: Stores indicator values at entry for winning trades - categorized as Buy, Sell, and High Trend
+4. **Predict**: Compares current market state to stored patterns using similarity scoring
+5. **Forward Testing**: Use learned patterns to make trading decisions
+
+**Indicators Used:**
+- SMA 9, EMA 30
+- CCI Period 20
+- ADX Period 8 with +DI, -DI
+- Bollinger Bands
+- ATR Period 14
+""")
