@@ -42,6 +42,13 @@ try:
 except Exception:
     MT5_AVAILABLE = False
 
+# Auto-refresh every 1 second
+if "refresh_time" not in st.session_state:
+    st.session_state.refresh_time = time.time()
+else:
+    if time.time() - st.session_state.refresh_time > 1:
+        st.session_state.refresh_time = time.time()
+        st.experimental_rerun()
 # ----------------------------
 # config & paths
 # ----------------------------
